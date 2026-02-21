@@ -67,20 +67,35 @@ impl DualWriter {
     }
 }
 
-// Thread-safe result writer for scanning results
+// Thread-safe result writer with sequence counter
 struct ResultWriter {
     file: Option<Arc<Mutex<fs::File>>>,
+    counter: Arc<Mutex<usize>>,
 }
 
 impl ResultWriter {
     fn new(file_handle: Option<Arc<Mutex<fs::File>>>) -> Self {
-        Self { file: file_handle }
+        Self { 
+            file: file_handle,
+            counter: Arc::new(Mutex::new(0)),
+        }
     }
 
-    fn write_result(&self, result: &str) {
+    fn write_result(&self, file_path: &str, primitives: &str) {
+        // Get and increment counter
+        let seq_num = {
+            let mut counter = self.counter.lock().unwrap();
+            *counter += 1;
+            *counter
+        };
+        
+        let result = format!("{:<6}\t{:<50}\t{}\n", seq_num, file_path, primitives);
+        
+        // Print to stdout
         print!("{}", result);
         std::io::stdout().flush().ok();
         
+        // Write to file if available
         if let Some(ref f) = self.file {
             if let Ok(mut file) = f.lock() {
                 write!(file, "{}", result).ok();
@@ -124,58 +139,52 @@ fn get_crypto_patterns() -> Vec<CryptoPattern> {
 
         // Post-Quantum Cryptography (PQC) - NIST Standardized Algorithms
         
-        // CRYSTALS-Kyber (ML-KEM - FIPS 203) - Lattice-based KEM
-        // Kyber uses polynomial ring Zq[X]/(X^256+1), q = 3329
-        CryptoPattern::new("PQC_Kyber_q", vec![0x01, 0x0D]), // q = 3329 (0x0D01) little-endian
-        CryptoPattern::new("PQC_Kyber_n256", vec![0x00, 0x01, 0x00, 0x00]), // n = 256
+        // CRYSTALS-Kyber (ML-KEM - FIPS 203)
+        CryptoPattern::new("PQC_Kyber_q", vec![0x01, 0x0D]),
+        CryptoPattern::new("PQC_Kyber_n256", vec![0x00, 0x01, 0x00, 0x00]),
         
-        // CRYSTALS-Dilithium (ML-DSA - FIPS 204) - Lattice-based signature
-        // Dilithium also uses q = 8380417 (0x7FE001)
-        CryptoPattern::new("PQC_Dilithium_q_LE", vec![0x01, 0xE0, 0x7F, 0x00]), // q = 8380417 little-endian
-        CryptoPattern::new("PQC_Dilithium_q_BE", vec![0x00, 0x7F, 0xE0, 0x01]), // q = 8380417 big-endian
+        // CRYSTALS-Dilithium (ML-DSA - FIPS 204)
+        CryptoPattern::new("PQC_Dilithium_q_LE", vec![0x01, 0xE0, 0x7F, 0x00]),
+        CryptoPattern::new("PQC_Dilithium_q_BE", vec![0x00, 0x7F, 0xE0, 0x01]),
         
-        // SPHINCS+ (SLH-DSA - FIPS 205) - Hash-based signature
-        // SPHINCS+ uses SHAKE256 as one of its hash functions
+        // SPHINCS+ (SLH-DSA - FIPS 205)
         CryptoPattern::new("PQC_SPHINCS_SHAKE", b"SPHINCS+".to_vec()),
         
-        // Falcon (FN-DSA) - Lattice-based signature (NIST selected)
-        // Falcon uses NTRU lattices, q = 12289 (0x3001)
-        CryptoPattern::new("PQC_Falcon_q_LE", vec![0x01, 0x30]), // q = 12289 little-endian
-        CryptoPattern::new("PQC_Falcon_q_BE", vec![0x30, 0x01]), // q = 12289 big-endian
+        // Falcon (FN-DSA)
+        CryptoPattern::new("PQC_Falcon_q_LE", vec![0x01, 0x30]),
+        CryptoPattern::new("PQC_Falcon_q_BE", vec![0x30, 0x01]),
         
-        // NTRU - Lattice-based encryption (Round 3 finalist)
-        // NTRU uses N = 509, 677, 821 for different security levels
-        CryptoPattern::new("PQC_NTRU_n509", vec![0xFD, 0x01, 0x00, 0x00]), // N = 509 little-endian
-        CryptoPattern::new("PQC_NTRU_n677", vec![0xA5, 0x02, 0x00, 0x00]), // N = 677 little-endian
-        CryptoPattern::new("PQC_NTRU_n821", vec![0x35, 0x03, 0x00, 0x00]), // N = 821 little-endian
+        // NTRU
+        CryptoPattern::new("PQC_NTRU_n509", vec![0xFD, 0x01, 0x00, 0x00]),
+        CryptoPattern::new("PQC_NTRU_n677", vec![0xA5, 0x02, 0x00, 0x00]),
+        CryptoPattern::new("PQC_NTRU_n821", vec![0x35, 0x03, 0x00, 0x00]),
         
-        // SABER - Lattice-based KEM (Round 3 finalist)
-        // Saber uses q = 2^13 = 8192
-        CryptoPattern::new("PQC_SABER_q", vec![0x00, 0x20, 0x00, 0x00]), // q = 8192 (2^13) little-endian
+        // SABER
+        CryptoPattern::new("PQC_SABER_q", vec![0x00, 0x20, 0x00, 0x00]),
         
-        // Classic McEliece - Code-based encryption (NIST selected)
+        // Classic McEliece
         CryptoPattern::new("PQC_McEliece", b"mceliece".to_vec()),
         
-        // BIKE - Code-based KEM
+        // BIKE
         CryptoPattern::new("PQC_BIKE", b"BIKE".to_vec()),
         
-        // HQC (Hamming Quasi-Cyclic) - Code-based KEM
+        // HQC
         CryptoPattern::new("PQC_HQC", b"HQC".to_vec()),
         
-        // Rainbow - Multivariate signature (withdrawn due to attack)
+        // Rainbow
         CryptoPattern::new("PQC_Rainbow", b"Rainbow".to_vec()),
         
-        // XMSS (eXtended Merkle Signature Scheme) - Hash-based signature
+        // XMSS
         CryptoPattern::new("PQC_XMSS", b"XMSS".to_vec()),
         
-        // LMS/HSS (Leighton-Micali Signature / Hierarchical Signature System)
+        // LMS/HSS
         CryptoPattern::new("PQC_LMS", b"LMS".to_vec()),
         CryptoPattern::new("PQC_HSS", b"HSS".to_vec()),
         
-        // CSIDH - Isogeny-based key exchange
+        // CSIDH
         CryptoPattern::new("PQC_CSIDH", b"CSIDH".to_vec()),
         
-        // SQIsign - Isogeny-based signature
+        // SQIsign
         CryptoPattern::new("PQC_SQIsign", b"SQIsign".to_vec()),
 
         // Patterns from cryptoscan repository
@@ -463,8 +472,8 @@ fn main() {
     }
     writer.writeln("");
     
-    writer.writeln(&format!("{:<50}\t{}", "File", "Primitives"));
-    writer.writeln(&format!("{:<50}\t{}", "====", "=========="));
+    writer.writeln(&format!("{:<6}\t{:<50}\t{}", "#", "File", "Primitives"));
+    writer.writeln(&format!("{:<6}\t{:<50}\t{}", "=", "====", "=========="));
     
     let file_handle = writer.clone_file_handle();
     let result_writer = Arc::new(ResultWriter::new(file_handle));
@@ -485,12 +494,8 @@ fn main() {
             for file in chunk {
                 if let Some(found_primitives) = scan_file(&file, &patterns_clone) {
                     let file_str = file.to_string_lossy();
-                    let mut result = format!("{:<50}\t", file_str);
-                    for primitive in found_primitives {
-                        result.push_str(&format!("{} ", primitive));
-                    }
-                    result.push('\n');
-                    result_writer_clone.write_result(&result);
+                    let primitives_str = found_primitives.join(" ");
+                    result_writer_clone.write_result(&file_str, &primitives_str);
                 }
             }
         });
