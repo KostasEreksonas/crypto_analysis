@@ -1,11 +1,11 @@
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::collections::HashSet;
-use regex::bytes::Regex;
+use std::collections::{HashMap, HashSet};
 
 struct CryptoPattern {
     name: &'static str,
@@ -21,6 +21,12 @@ impl CryptoPattern {
         content.windows(self.pattern.len())
             .any(|window| window == self.pattern.as_slice())
     }
+}
+
+#[derive(Clone, Debug)]
+struct FileResult {
+    path: PathBuf,
+    primitives: Vec<String>,
 }
 
 // Thread-safe dual writer
@@ -50,56 +56,36 @@ impl DualWriter {
         }
     }
 
-    fn write(&self, text: &str) {
-        print!("{}", text);
-
-        if let Some(ref f) = self.file {
-            if let Ok(mut file) = f.lock() {
-                write!(file, "{}", text).unwrap_or_else(|e| {
-                    eprintln!("Warning: Failed to write to file: {}", e);
-                });
-            }
-        }
-    }
-
     fn clone_file_handle(&self) -> Option<Arc<Mutex<fs::File>>> {
         self.file.clone()
     }
 }
 
-// Thread-safe result writer with sequence counter
-struct ResultWriter {
-    file: Option<Arc<Mutex<fs::File>>>,
-    counter: Arc<Mutex<usize>>,
+// Thread-safe result collector
+struct ResultCollector {
+    results: Arc<Mutex<Vec<FileResult>>>,
 }
 
-impl ResultWriter {
-    fn new(file_handle: Option<Arc<Mutex<fs::File>>>) -> Self {
+impl ResultCollector {
+    fn new() -> Self {
         Self {
-            file: file_handle,
-            counter: Arc::new(Mutex::new(0)),
+            results: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    fn write_result(&self, file_path: &str, primitives: &str) {
-        // Get and increment counter
-        let seq_num = {
-            let mut counter = self.counter.lock().unwrap();
-            *counter += 1;
-            *counter
-        };
+    fn add_result(&self, path: PathBuf, primitives: Vec<String>) {
+        let mut results = self.results.lock().unwrap();
+        results.push(FileResult { path, primitives });
+    }
 
-        let result = format!("{:<6}\t{:<50}\t{}\n", seq_num, file_path, primitives);
+    fn get_results(&self) -> Vec<FileResult> {
+        let results = self.results.lock().unwrap();
+        results.clone()
+    }
 
-        // Print to stdout
-        print!("{}", result);
-        std::io::stdout().flush().ok();
-
-        // Write to file if available
-        if let Some(ref f) = self.file {
-            if let Ok(mut file) = f.lock() {
-                write!(file, "{}", result).ok();
-            }
+    fn clone_collector(&self) -> Self {
+        Self {
+            results: Arc::clone(&self.results),
         }
     }
 }
@@ -137,7 +123,7 @@ fn get_crypto_patterns() -> Vec<CryptoPattern> {
         CryptoPattern::new("RSA_e257_BE32", vec![0x00, 0x00, 0x01, 0x01]),
         CryptoPattern::new("RSA_e257_LE32", vec![0x01, 0x01, 0x00, 0x00]),
 
-        // Post-Quantum Cryptography (PQC) patterns
+        // Post-Quantum Cryptography patterns
         CryptoPattern::new("PQC_Kyber_q", vec![0x01, 0x0D]),
         CryptoPattern::new("PQC_Kyber_n256", vec![0x00, 0x01, 0x00, 0x00]),
         CryptoPattern::new("PQC_Dilithium_q_LE", vec![0x01, 0xE0, 0x7F, 0x00]),
@@ -159,7 +145,7 @@ fn get_crypto_patterns() -> Vec<CryptoPattern> {
         CryptoPattern::new("PQC_CSIDH", b"CSIDH".to_vec()),
         CryptoPattern::new("PQC_SQIsign", b"SQIsign".to_vec()),
 
-        // Additional patterns from cryptoscan repository
+        // Additional patterns
         CryptoPattern::new("IKE_prime", vec![0xFF, 0xFF, 0xFF, 0xFF]),
         CryptoPattern::new("AES_sbox", vec![0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5]),
         CryptoPattern::new("AES_inv_sbox", vec![0x52, 0x09, 0x6a, 0xd5]),
@@ -190,23 +176,82 @@ fn scan_file<'a>(path: &PathBuf, patterns: &'a [CryptoPattern]) -> Option<Vec<&'
     }
 }
 
-fn traverse_filesystem(root: PathBuf, patterns: &[CryptoPattern], result_writer: Arc<ResultWriter>) {
+#[cfg(unix)]
+fn get_linked_libraries(binary_path: &Path) -> Vec<PathBuf> {
+    let output = Command::new("ldd")
+        .arg(binary_path)
+        .output();
+
+    if let Ok(output) = output {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut libraries = Vec::new();
+
+            for line in stdout.lines() {
+                if let Some(path_part) = line.split("=>").nth(1) {
+                    let path_str = path_part.trim().split_whitespace().next();
+                    if let Some(path_str) = path_str {
+                        let lib_path = PathBuf::from(path_str);
+                        if lib_path.exists() && lib_path.is_file() {
+                            libraries.push(lib_path);
+                        }
+                    }
+                } else if line.trim().starts_with('/') {
+                    let path_str = line.trim().split_whitespace().next();
+                    if let Some(path_str) = path_str {
+                        let lib_path = PathBuf::from(path_str);
+                        if lib_path.exists() && lib_path.is_file() {
+                            libraries.push(lib_path);
+                        }
+                    }
+                }
+            }
+
+            return libraries;
+        }
+    }
+
+    Vec::new()
+}
+
+#[cfg(not(unix))]
+fn get_linked_libraries(_binary_path: &Path) -> Vec<PathBuf> {
+    Vec::new()
+}
+
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = fs::metadata(path) {
+            let permissions = metadata.permissions();
+            return permissions.mode() & 0o111 != 0;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Some(ext) = path.extension() {
+            let ext_str = ext.to_string_lossy().to_lowercase();
+            return ext_str == "exe" || ext_str == "dll";
+        }
+    }
+    false
+}
+
+fn traverse_filesystem(root: PathBuf) -> Vec<PathBuf> {
     let walker = walkdir::WalkDir::new(root)
         .follow_links(false)
         .into_iter()
         .filter_map(|e| e.ok());
 
+    let mut files = Vec::new();
     for entry in walker {
         let path = entry.path();
-        
         if path.is_file() {
-            if let Some(found_primitives) = scan_file(&path.to_path_buf(), patterns) {
-                let file_str = path.to_string_lossy();
-                let primitives_str = found_primitives.join(" ");
-                result_writer.write_result(&file_str, &primitives_str);
-            }
+            files.push(path.to_path_buf());
         }
     }
+    files
 }
 
 fn get_unique_directories(files: &[PathBuf]) -> Vec<String> {
@@ -221,6 +266,66 @@ fn get_unique_directories(files: &[PathBuf]) -> Vec<String> {
     let mut sorted_dirs: Vec<String> = dirs.into_iter().collect();
     sorted_dirs.sort();
     sorted_dirs
+}
+
+fn organize_by_binaries_and_libs(results: &[FileResult], writer: &DualWriter) {
+    // Create a map of path -> primitives
+    let mut result_map: HashMap<PathBuf, Vec<String>> = HashMap::new();
+    for result in results {
+        result_map.insert(result.path.clone(), result.primitives.clone());
+    }
+
+    // Separate executables from libraries
+    let mut executables = Vec::new();
+    let mut libraries = HashSet::new();
+
+    for result in results {
+        if is_executable(&result.path) {
+            executables.push(result.path.clone());
+        } else {
+            libraries.insert(result.path.clone());
+        }
+    }
+
+    writer.writeln("");
+    writer.writeln("=== Organized by Binaries and Their Libraries ===");
+    writer.writeln("");
+
+    let mut binary_count = 0;
+
+    for exe_path in &executables {
+        let linked_libs = get_linked_libraries(exe_path);
+        
+        // Check if this executable or any of its libraries have crypto
+        let exe_has_crypto = result_map.contains_key(exe_path);
+        let libs_with_crypto: Vec<_> = linked_libs.iter()
+            .filter(|lib| result_map.contains_key(*lib))
+            .collect();
+
+        if exe_has_crypto || !libs_with_crypto.is_empty() {
+            binary_count += 1;
+            writer.writeln(&format!("Binary #{}: {}", binary_count, exe_path.display()));
+            
+            if let Some(primitives) = result_map.get(exe_path) {
+                writer.writeln(&format!("  Primitives: {}", primitives.join(", ")));
+            } else {
+                writer.writeln("  Primitives: (none)");
+            }
+
+            if !libs_with_crypto.is_empty() {
+                writer.writeln("  Linked libraries with crypto:");
+                for lib in libs_with_crypto {
+                    writer.writeln(&format!("    - {}", lib.display()));
+                    if let Some(primitives) = result_map.get(lib) {
+                        writer.writeln(&format!("      Primitives: {}", primitives.join(", ")));
+                    }
+                }
+            }
+            writer.writeln("");
+        }
+    }
+
+    writer.writeln(&format!("Total binaries with crypto: {}", binary_count));
 }
 
 fn main() {
@@ -279,49 +384,94 @@ fn main() {
     }
     eprintln!("Using {} threads for scanning", num_threads);
 
-    writer.writeln(&format!("{:<6}\t{:<50}\t{}", "#", "File", "Primitives"));
-    writer.writeln(&format!("{:<6}\t{:<50}\t{}", "=", "====", "=========="));
-
-    let file_handle = writer.clone_file_handle();
-    let result_writer = Arc::new(ResultWriter::new(file_handle));
-
-    if !scan_args.is_empty() {
-        // User provided specific paths
-        let mut handles = vec![];
-        
+    let files_to_scan: Vec<PathBuf> = if !scan_args.is_empty() {
+        let mut files = Vec::new();
         for arg in &scan_args {
             let path = PathBuf::from(arg);
-            let patterns_clone = get_crypto_patterns();
-            let result_writer_clone = Arc::clone(&result_writer);
-            
-            let handle = thread::spawn(move || {
-                if path.is_dir() {
-                    traverse_filesystem(path, &patterns_clone, result_writer_clone);
-                } else if path.is_file() {
-                    if let Some(found_primitives) = scan_file(&path, &patterns_clone) {
-                        let file_str = path.to_string_lossy();
-                        let primitives_str = found_primitives.join(" ");
-                        result_writer_clone.write_result(&file_str, &primitives_str);
-                    }
-                }
-            });
-            
-            handles.push(handle);
+            if path.is_dir() {
+                files.extend(traverse_filesystem(path));
+            } else if path.is_file() {
+                files.push(path);
+            }
         }
-        
-        for handle in handles {
-            handle.join().unwrap();
-        }
+        files
     } else {
-        // No arguments: scan entire filesystem from root
         #[cfg(unix)]
         let root = PathBuf::from("/");
         #[cfg(windows)]
         let root = PathBuf::from("C:\\");
         
         eprintln!("Scanning entire filesystem from {}...", root.display());
-        eprintln!("Warning: This may take a very long time and requires elevated privileges for full access");
-        
-        traverse_filesystem(root, &patterns, result_writer);
+        traverse_filesystem(root)
+    };
+
+    let unique_dirs = get_unique_directories(&files_to_scan);
+
+    writer.writeln(&format!("=== Scanning {} files from {} directories ===",
+        files_to_scan.len(), unique_dirs.len()));
+    writer.writeln("");
+    writer.writeln("Directories being scanned:");
+    for dir in &unique_dirs {
+        writer.writeln(&format!("  - {}", dir));
     }
+    writer.writeln("");
+
+    writer.writeln(&format!("{:<6}\t{:<50}\t{}", "#", "File", "Primitives"));
+    writer.writeln(&format!("{:<6}\t{:<50}\t{}", "=", "====", "=========="));
+
+    // Collect results during scan
+    let collector = ResultCollector::new();
+
+    let chunk_size = (files_to_scan.len() + num_threads - 1) / num_threads;
+    let file_chunks: Vec<Vec<PathBuf>> = files_to_scan
+        .chunks(chunk_size)
+        .map(|chunk| chunk.to_vec())
+        .collect();
+
+    let mut handles = vec![];
+    let counter = Arc::new(Mutex::new(0usize));
+
+    for chunk in file_chunks {
+        let patterns_clone = get_crypto_patterns();
+        let collector_clone = collector.clone_collector();
+        let counter_clone = Arc::clone(&counter);
+
+        let handle = thread::spawn(move || {
+            for file in chunk {
+                if let Some(found_primitives) = scan_file(&file, &patterns_clone) {
+                    let primitives_vec: Vec<String> = found_primitives.iter()
+                        .map(|s| s.to_string())
+                        .collect();
+                    
+                    // Get sequence number
+                    let seq_num = {
+                        let mut counter = counter_clone.lock().unwrap();
+                        *counter += 1;
+                        *counter
+                    };
+
+                    let file_str = file.to_string_lossy();
+                    let primitives_str = primitives_vec.join(" ");
+                    println!("{:<6}\t{:<50}\t{}", seq_num, file_str, primitives_str);
+                    
+                    collector_clone.add_result(file.clone(), primitives_vec);
+                }
+            }
+        });
+
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    // Get all results
+    let results = collector.get_results();
+    
+    writer.writeln("");
+    writer.writeln(&format!("=== Scan Complete: {} files with crypto primitives ===", results.len()));
+
+    // Organize and display by binaries and libraries
+    organize_by_binaries_and_libs(&results, &writer);
 }
