@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 regex = "1"
 num_cpus = "1"
+walkdir = "2"
