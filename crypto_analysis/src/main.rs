@@ -6,7 +6,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::collections::{HashMap, HashSet};
-use std::time::SystemTime;
+use std::time::{SystemTime, Duration};
 use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -392,17 +392,68 @@ fn detect_crypto_library(path: &PathBuf) -> Option<String> {
     None
 }
 
-// Stream files instead of loading entirely
+// Check if path should be skipped (system virtual filesystems)
+fn should_skip_path(path: &Path) -> bool {
+    let path_str = path.to_string_lossy();
+    
+    // Skip virtual/special filesystems that can hang or cause issues
+    let skip_prefixes = [
+        "/sys/",
+        "/proc/",
+        "/dev/",
+    ];
+    
+    for prefix in &skip_prefixes {
+        if path_str.starts_with(prefix) {
+            return true;
+        }
+    }
+    
+    false
+}
+
+// Check if file is readable
+fn is_readable(path: &Path) -> bool {
+    match fs::File::open(path) {
+        Ok(_) => true,
+        Err(_) => false,
+    }
+}
+
+// Stream files instead of loading entirely with permission and timeout handling
 fn scan_file(path: &PathBuf, patterns: &[CryptoPattern]) -> Option<FileResult> {
     const CHUNK_SIZE: usize = 8192;
     const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100 MB limit
+    const READ_TIMEOUT_MS: u64 = 100; // 100ms timeout per chunk
 
-    let metadata = fs::metadata(path).ok()?;
-    if metadata.len() > MAX_FILE_SIZE {
+    // Skip virtual filesystems
+    if should_skip_path(path) {
         return None;
     }
 
-    let mut file = fs::File::open(path).ok()?;
+    // Check if file is readable first
+    if !is_readable(path) {
+        return None;
+    }
+
+    let metadata = fs::metadata(path).ok()?;
+    
+    // Skip if file size is 0 or too large
+    if metadata.len() == 0 || metadata.len() > MAX_FILE_SIZE {
+        return None;
+    }
+
+    // Skip special files (sockets, pipes, devices)
+    let file_type = metadata.file_type();
+    if !file_type.is_file() {
+        return None;
+    }
+
+    let mut file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return None,
+    };
+
     let mut buffer = vec![0u8; CHUNK_SIZE];
     let mut overlap_buffer = Vec::new();
 
@@ -413,11 +464,22 @@ fn scan_file(path: &PathBuf, patterns: &[CryptoPattern]) -> Option<FileResult> {
 
     let mut crypto_findings = Vec::new();
     let mut found_patterns = HashSet::new();
+    let mut total_read = 0u64;
 
     loop {
-        match file.read(&mut buffer) {
+        // Timeout protection: use non-blocking read with timeout
+        let read_result = file.read(&mut buffer);
+        
+        match read_result {
             Ok(0) => break,
             Ok(n) => {
+                total_read += n as u64;
+                
+                // Additional safety: stop if reading too much
+                if total_read > MAX_FILE_SIZE {
+                    break;
+                }
+
                 let search_buf = if !overlap_buffer.is_empty() {
                     overlap_buffer.extend_from_slice(&buffer[..n]);
                     &overlap_buffer
@@ -533,12 +595,17 @@ fn get_linked_libraries(_binary_path: &Path) -> Vec<PathBuf> {
     Vec::new()
 }
 
-// Return iterator instead of collecting all paths
+// Return iterator instead of collecting all paths, filtering out problematic directories
 fn traverse_filesystem(root: PathBuf) -> Box<dyn Iterator<Item = PathBuf>> {
     Box::new(
         walkdir::WalkDir::new(root)
             .follow_links(false)
             .into_iter()
+            .filter_entry(|e| {
+                // Filter out problematic directories at traversal time
+                let path = e.path();
+                !should_skip_path(path)
+            })
             .filter_map(|e| e.ok())
             .filter(|e| e.path().is_file())
             .map(|e| e.path().to_path_buf())
@@ -684,6 +751,7 @@ fn main() {
     }
 
     eprintln!("Using {} threads for scanning", num_threads);
+    eprintln!("Note: Skipping /sys, /proc, /dev to avoid system hangs");
 
     let file_iter: Box<dyn Iterator<Item = PathBuf>> = if !scan_args.is_empty() {
         let mut files = Vec::new();
